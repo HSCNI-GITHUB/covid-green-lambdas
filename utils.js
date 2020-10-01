@@ -1,10 +1,14 @@
 const AWS = require('aws-sdk')
+const SQL = require('@nearform/sql')
+const fetch = require('node-fetch')
 const jwt = require('jsonwebtoken')
 const pg = require('pg')
 
 const isProduction = /^\s*production\s*$/i.test(process.env.NODE_ENV)
 const ssm = new AWS.SSM({ region: process.env.AWS_REGION })
-const secretsManager = new AWS.SecretsManager({ region: process.env.AWS_REGION })
+const secretsManager = new AWS.SecretsManager({
+  region: process.env.AWS_REGION
+})
 
 async function getParameter(id) {
   const response = await ssm
@@ -30,13 +34,35 @@ async function getAssetsBucket() {
   }
 }
 
+async function getExpiryConfig() {
+  if (isProduction) {
+    const [codeLifetime, tokenLifetime] = await Promise.all([
+      getParameter('security_code_removal_mins'),
+      getParameter('upload_token_lifetime_mins')
+    ])
+
+    return { codeLifetime, tokenLifetime }
+  } else {
+    return {
+      codeLifetime: process.env.CODE_LIFETIME_MINS,
+      tokenLifetime: process.env.UPLOAD_TOKEN_LIFETIME_MINS
+    }
+  }
+}
+
 async function getDatabase() {
   require('pg-range').install(pg)
 
   let client
 
   if (isProduction) {
-    const [{ username: user, password }, host, port, ssl, database] = await Promise.all([
+    const [
+      { username: user, password },
+      host,
+      port,
+      ssl,
+      database
+    ] = await Promise.all([
       getSecret('rds-read-write'),
       getParameter('db_host'),
       getParameter('db_port'),
@@ -44,21 +70,38 @@ async function getDatabase() {
       getParameter('db_database')
     ])
 
-    client = new pg.Client({
+    const options = {
       host,
       database,
       user,
       password,
-      port: Number(port),
-      ssl: ssl === 'true'
-    })
+      port: Number(port)
+    }
+
+    if (/true/i.test(ssl)) {
+      const certResponse = await fetch(
+        'https://s3.amazonaws.com/rds-downloads/rds-combined-ca-bundle.pem'
+      )
+      const certBody = await certResponse.text()
+
+      options.ssl = {
+        ca: [certBody],
+        rejectUnauthorized: true
+      }
+    } else {
+      options.ssl = false
+    }
+
+    client = new pg.Client(options)
   } else {
     const { user, password, host, port, ssl, database } = {
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
       host: process.env.DB_HOST,
       port: Number(process.env.DB_PORT),
-      ssl:  /true/i.test(process.env.DB_SSL),
+      ssl: /true/i.test(process.env.DB_SSL)
+        ? { rejectUnauthorized: false }
+        : false,
       database: process.env.DB_DATABASE
     }
 
@@ -68,7 +111,7 @@ async function getDatabase() {
       user,
       password,
       port: Number(port),
-      ssl: ssl === 'true'
+      ssl
     })
   }
 
@@ -80,23 +123,34 @@ async function getDatabase() {
 async function getExposuresConfig() {
   if (isProduction) {
     const [
-      { privateKey, signatureAlgorithm, verificationKeyId, verificationKeyVersion },
+      {
+        privateKey,
+        signatureAlgorithm,
+        verificationKeyId,
+        verificationKeyVersion
+      },
       appBundleId,
       defaultRegion,
-      nativeRegions
+      disableValidKeyCheck,
+      nativeRegions,
+      varianceOffsetMins
     ] = await Promise.all([
       getSecret('exposures'),
       getParameter('app_bundle_id'),
       getParameter('default_region'),
-      getParameter('native_regions')
+      getParameter('disable_valid_key_check'),
+      getParameter('native_regions'),
+      getParameter('variance_offset_mins')
     ])
 
     return {
       appBundleId,
       defaultRegion,
+      disableValidKeyCheck: /true/i.test(disableValidKeyCheck),
       nativeRegions: nativeRegions.split(','),
       privateKey,
       signatureAlgorithm,
+      varianceOffsetMins: Number(varianceOffsetMins),
       verificationKeyId,
       verificationKeyVersion
     }
@@ -104,9 +158,11 @@ async function getExposuresConfig() {
     return {
       appBundleId: process.env.APP_BUNDLE_ID,
       defaultRegion: process.env.EXPOSURES_DEFAULT_REGION,
+      disableValidKeyCheck: /true/i.test(process.env.DISABLE_VALID_KEY_CHECK),
       nativeRegions: process.env.EXPOSURES_NATIVE_REGIONS.split(','),
       privateKey: process.env.EXPOSURES_PRIVATE_KEY,
       signatureAlgorithm: process.env.EXPOSURES_SIGNATURE_ALGORITHM,
+      varianceOffsetMins: Number(process.env.VARIANCE_OFFSET_MINS),
       verificationKeyId: process.env.EXPOSURES_KEY_ID,
       verificationKeyVersion: process.env.EXPOSURES_KEY_VERSION
     }
@@ -115,10 +171,27 @@ async function getExposuresConfig() {
 
 async function getInteropConfig() {
   if (isProduction) {
-    return await getSecret('interop')
+    const [
+      { certificate, maxAge, privateKey, token, url },
+      origin
+    ] = await Promise.all([
+      getSecret('interop'),
+      getParameter('default_region')
+    ])
+
+    return {
+      certificate,
+      maxAge,
+      origin,
+      privateKey,
+      token,
+      url
+    }
   } else {
     return {
+      certificate: process.env.INTEROP_CERTIFICATE,
       maxAge: Number(process.env.INTEROP_MAX_AGE),
+      origin: process.env.EXPOSURES_DEFAULT_REGION,
       privateKey: process.env.INTEROP_PRIVATE_KEY,
       token: process.env.INTEROP_TOKEN,
       url: process.env.INTEROP_URL
@@ -134,6 +207,16 @@ async function getJwtSecret() {
   } else {
     return process.env.JWT_SECRET
   }
+}
+
+async function insertMetric(client, event, os, version, value = 1) {
+  const query = SQL`
+    INSERT INTO metrics (date, event, os, version, value)
+    VALUES (CURRENT_DATE, ${event}, ${os}, ${version}, ${value})
+    ON CONFLICT ON CONSTRAINT metrics_pkey
+    DO UPDATE SET value = metrics.value + ${value}`
+
+  await client.query(query)
 }
 
 function isAuthorized(token, secret) {
@@ -167,9 +250,11 @@ function runIfDev(fn) {
 module.exports = {
   getAssetsBucket,
   getDatabase,
+  getExpiryConfig,
   getExposuresConfig,
   getInteropConfig,
   getJwtSecret,
+  insertMetric,
   isAuthorized,
   runIfDev
 }
